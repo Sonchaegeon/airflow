@@ -243,7 +243,6 @@ class DagRun(Base, LoggingMixin):
     def refresh_from_db(self, session: Session = NEW_SESSION) -> None:
         """
         Reloads the current dagrun from the database
-
         :param session: database session
         """
         dr = session.query(DagRun).filter(DagRun.dag_id == self.dag_id, DagRun.run_id == self.run_id).one()
@@ -275,11 +274,9 @@ class DagRun(Base, LoggingMixin):
     ):
         """
         Return the next DagRuns that the scheduler should attempt to schedule.
-
         This will return zero or more DagRun rows that are row-level-locked with a "SELECT ... FOR UPDATE"
         query, you should ensure that any scheduling decisions are made in a single transaction -- as soon as
         the transaction is committed it will be unlocked.
-
         :rtype: list[airflow.models.DagRun]
         """
         from airflow.models.dag import DagModel
@@ -335,7 +332,6 @@ class DagRun(Base, LoggingMixin):
     ) -> List["DagRun"]:
         """
         Returns a set of dag runs for the given search criteria.
-
         :param dag_id: the dag_id or list of dag_id to find dag runs for
         :param run_id: defines the run id for this dag run
         :param run_type: type of DagRun
@@ -389,9 +385,7 @@ class DagRun(Base, LoggingMixin):
     ) -> Optional['DagRun']:
         """
         Return an existing run for the DAG with a specific run_id or execution_date.
-
         *None* is returned if no such DAG run is found.
-
         :param dag_id: the dag_id to find duplicates for
         :param run_id: defines the run id for this dag run
         :param execution_date: the execution date
@@ -455,7 +449,6 @@ class DagRun(Base, LoggingMixin):
     ) -> Optional[TI]:
         """
         Returns the task instance specified by task_id for this dag run
-
         :param task_id: the task id
         :param session: Sqlalchemy ORM Session
         """
@@ -468,7 +461,6 @@ class DagRun(Base, LoggingMixin):
     def get_dag(self) -> "DAG":
         """
         Returns the Dag associated with this DagRun.
-
         :return: DAG
         """
         if not self.dag:
@@ -510,7 +502,6 @@ class DagRun(Base, LoggingMixin):
         """
         Determines the overall state of the DagRun based on the state
         of its TaskInstances.
-
         :param session: Sqlalchemy ORM Session
         :param execute_callbacks: Should dag callbacks (success/failure, SLA etc) be invoked
             directly (default: true) or recorded as a pending request in the ``callback`` property
@@ -655,9 +646,6 @@ class DagRun(Base, LoggingMixin):
                     yield ti
 
         tis = list(_filter_tis_and_exclude_removed(self.get_dag(), tis))
-        missing_indexes = self._revise_mapped_task_indexes(tis, session=session)
-        if missing_indexes:
-            self.verify_integrity(missing_indexes=missing_indexes, session=session)
 
         unfinished_tis = [t for t in tis if t.state in State.unfinished]
         finished_tis = [t for t in tis if t.state in State.finished]
@@ -729,6 +717,11 @@ class DagRun(Base, LoggingMixin):
                     additional_tis.extend(expanded_tis[1:])
                 expansion_happened = True
             if schedulable.state in SCHEDULEABLE_STATES:
+                task = schedulable.task
+                if isinstance(schedulable.task, MappedOperator):
+                    # Ensure the task indexes are complete
+                    created = self._revise_mapped_task_indexes(task, session=session)
+                    ready_tis.extend(created)
                 ready_tis.append(schedulable)
 
         # Check if any ti changed state
@@ -824,13 +817,11 @@ class DagRun(Base, LoggingMixin):
     def verify_integrity(
         self,
         *,
-        missing_indexes: Optional[Dict["MappedOperator", Sequence[int]]] = None,
         session: Session = NEW_SESSION,
     ):
         """
         Verifies the DagRun by checking for removed tasks or tasks that are not in the
         database yet. It will set state to removed or add the task if required.
-
         :missing_indexes: A dictionary of task vs indexes that are missing.
         :param session: Sqlalchemy ORM Session
         """
@@ -841,15 +832,10 @@ class DagRun(Base, LoggingMixin):
 
         dag = self.get_dag()
         task_ids: Set[str] = set()
-        if missing_indexes:
-            tis = self.get_task_instances(session=session)
-            for ti in tis:
-                task_instance_mutation_hook(ti)
-                task_ids.add(ti.task_id)
-        else:
-            task_ids, missing_indexes = self._check_for_removed_or_restored_tasks(
-                dag, task_instance_mutation_hook, session=session
-            )
+
+        task_ids = self._check_for_removed_or_restored_tasks(
+            dag, task_instance_mutation_hook, session=session
+        )
 
         def task_filter(task: "Operator") -> bool:
             return task.task_id not in task_ids and (
@@ -864,29 +850,24 @@ class DagRun(Base, LoggingMixin):
         task_creator = self._get_task_creator(created_counts, task_instance_mutation_hook, hook_is_noop)
 
         # Create the missing tasks, including mapped tasks
-        tasks = self._create_missing_tasks(dag, task_creator, task_filter, missing_indexes, session=session)
+        tasks = self._create_tasks(dag, task_creator, task_filter, session=session)
 
         self._create_task_instances(dag.dag_id, tasks, created_counts, hook_is_noop, session=session)
 
     def _check_for_removed_or_restored_tasks(
         self, dag: "DAG", ti_mutation_hook, *, session: Session
-    ) -> Tuple[Set[str], Dict["MappedOperator", Sequence[int]]]:
+    ) -> Set[str]:
         """
         Check for removed tasks/restored/missing tasks.
-
         :param dag: DAG object corresponding to the dagrun
         :param ti_mutation_hook: task_instance_mutation_hook function
         :param session: Sqlalchemy ORM Session
-
-        :return: List of task_ids in the dagrun and missing task indexes
-
+        :return: Task IDs in the DAG run
         """
         tis = self.get_task_instances(session=session)
 
         # check for removed or restored tasks
         task_ids = set()
-        existing_indexes: Dict["MappedOperator", List[int]] = defaultdict(list)
-        expected_indexes: Dict["MappedOperator", Sequence[int]] = defaultdict(list)
         for ti in tis:
             ti_mutation_hook(ti)
             task_ids.add(ti.task_id)
@@ -924,13 +905,9 @@ class DagRun(Base, LoggingMixin):
                 elif ti.map_index < 0:
                     self.log.debug("Removing the unmapped TI '%s' as the mapping can now be performed", ti)
                     ti.state = State.REMOVED
-                else:
-                    self.log.info("Restoring mapped task '%s'", ti)
-                    Stats.incr(f"task_restored_to_dag.{dag.dag_id}", 1, 1)
-                    existing_indexes[task].append(ti.map_index)
-                    expected_indexes[task] = range(num_mapped_tis)
             else:
                 #  What if it is _now_ dynamically mapped, but wasn't before?
+                task.run_time_mapped_ti_count.cache_clear()  # type: ignore[attr-defined]
                 total_length = task.run_time_mapped_ti_count(self.run_id, session=session)
 
                 if total_length is None:
@@ -949,29 +926,18 @@ class DagRun(Base, LoggingMixin):
                         total_length,
                     )
                     ti.state = State.REMOVED
-                else:
-                    self.log.info("Restoring mapped task '%s'", ti)
-                    Stats.incr(f"task_restored_to_dag.{dag.dag_id}", 1, 1)
-                    existing_indexes[task].append(ti.map_index)
-                    expected_indexes[task] = range(total_length)
-        # Check if we have some missing indexes to create ti for
-        missing_indexes: Dict["MappedOperator", Sequence[int]] = defaultdict(list)
-        for k, v in existing_indexes.items():
-            missing_indexes.update({k: list(set(expected_indexes[k]).difference(v))})
-        return task_ids, missing_indexes
+
+        return task_ids
 
     def _get_task_creator(
         self, created_counts: Dict[str, int], ti_mutation_hook: Callable, hook_is_noop: bool
     ) -> Callable:
         """
         Get the task creator function.
-
         This function also updates the created_counts dictionary with the number of tasks created.
-
         :param created_counts: Dictionary of task_type -> count of created TIs
         :param ti_mutation_hook: task_instance_mutation_hook function
         :param hook_is_noop: Whether the task_instance_mutation_hook is a noop
-
         """
         if hook_is_noop:
 
@@ -994,18 +960,16 @@ class DagRun(Base, LoggingMixin):
             creator = create_ti
         return creator
 
-    def _create_missing_tasks(
+    def _create_tasks(
         self,
         dag: "DAG",
         task_creator: Callable,
         task_filter: Callable,
-        missing_indexes: Optional[Dict["MappedOperator", Sequence[int]]],
         *,
         session: Session,
     ) -> Iterable["Operator"]:
         """
         Create missing tasks -- and expand any MappedOperator that _only_ have literals as input
-
         :param dag: DAG object corresponding to the dagrun
         :param task_creator: a function that creates tasks
         :param task_filter: a function that filters tasks to create
@@ -1030,12 +994,7 @@ class DagRun(Base, LoggingMixin):
         tasks_and_map_idxs = map(expand_mapped_literals, filter(task_filter, dag.task_dict.values()))
 
         tasks = itertools.chain.from_iterable(itertools.starmap(task_creator, tasks_and_map_idxs))
-        if missing_indexes:
-            # If there are missing indexes, override the tasks to create
-            new_tasks_and_map_idxs = itertools.starmap(
-                expand_mapped_literals, [(k, v) for k, v in missing_indexes.items() if len(v) > 0]
-            )
-            tasks = itertools.chain.from_iterable(itertools.starmap(task_creator, new_tasks_and_map_idxs))
+
         return tasks
 
     def _create_task_instances(
@@ -1049,13 +1008,11 @@ class DagRun(Base, LoggingMixin):
     ) -> None:
         """
         Create the necessary task instances from the given tasks.
-
         :param dag_id: DAG ID associated with the dagrun
         :param tasks: the tasks to create the task instances from
         :param created_counts: a dictionary of number of tasks -> total ti created by the task creator
         :param hook_is_noop: whether the task_instance_mutation_hook is noop
         :param session: the session to use
-
         """
         # Fetch the information we need before handling the exception to avoid
         # PendingRollbackError due to the session being invalidated on exception
@@ -1081,50 +1038,54 @@ class DagRun(Base, LoggingMixin):
             # TODO[HA]: We probably need to savepoint this so we can keep the transaction alive.
             session.rollback()
 
-    def _revise_mapped_task_indexes(
-        self,
-        tis: Iterable[TI],
-        *,
-        session: Session,
-    ) -> Dict["MappedOperator", Sequence[int]]:
-        """Check if the length of the mapped task instances changed at runtime and find the missing indexes.
+    def _revise_mapped_task_indexes(self, task, session: Session):
+        """Check if task increased or reduced in length and handle appropriately"""
+        from airflow.models.taskinstance import TaskInstance
+        from airflow.settings import task_instance_mutation_hook
 
-        :param tis: Task instances to check
-        :param session: The session to use
-        """
-        from airflow.models.mappedoperator import MappedOperator
+        task.run_time_mapped_ti_count.cache_clear()
+        total_length = (
+            task.parse_time_mapped_ti_count
+            or task.run_time_mapped_ti_count(self.run_id, session=session)
+            or 0
+        )
+        existing_tis = (
+            session.query(TaskInstance)
+            .filter(
+                TaskInstance.dag_id == self.dag_id,
+                TaskInstance.task_id == task.task_id,
+                TaskInstance.run_id == self.run_id,
+            )
+            .all()
+        )
+        existing_indexes = [i.map_index for i in existing_tis]
+        missing_tis = set(range(total_length)).difference(set(existing_indexes))
+        removed_tis = set(existing_indexes).difference(range(total_length))
+        created_tis = []
 
-        existing_indexes: Dict[MappedOperator, List[int]] = defaultdict(list)
-        new_indexes: Dict[MappedOperator, Sequence[int]] = defaultdict(list)
-        for ti in tis:
-            task = ti.task
-            if not isinstance(task, MappedOperator):
-                continue
-            # skip unexpanded tasks and also tasks that expands with literal arguments
-            if ti.map_index < 0 or task.parse_time_mapped_ti_count:
-                continue
-            existing_indexes[task].append(ti.map_index)
-            task.run_time_mapped_ti_count.cache_clear()  # type: ignore[attr-defined]
-            new_length = task.run_time_mapped_ti_count(self.run_id, session=session) or 0
-
-            if ti.map_index >= new_length:
-                self.log.debug(
-                    "Removing task '%s' as the map_index is longer than the resolved mapping list (%d)",
-                    ti,
-                    new_length,
-                )
-                ti.state = State.REMOVED
-            new_indexes[task] = range(new_length)
-        missing_indexes: Dict[MappedOperator, Sequence[int]] = defaultdict(list)
-        for k, v in existing_indexes.items():
-            missing_indexes.update({k: list(set(new_indexes[k]).difference(v))})
-        return missing_indexes
+        if missing_tis:
+            for index in missing_tis:
+                ti = TaskInstance(task, run_id=self.run_id, map_index=index, state=None)
+                self.log.debug("Expanding TIs upserted %s", ti)
+                task_instance_mutation_hook(ti)
+                ti = session.merge(ti)
+                ti.refresh_from_task(task)
+                session.flush()
+                created_tis.append(ti)
+        elif removed_tis:
+            session.query(TaskInstance).filter(
+                TaskInstance.dag_id == self.dag_id,
+                TaskInstance.task_id == task.task_id,
+                TaskInstance.run_id == self.run_id,
+                TaskInstance.map_index.in_(removed_tis),
+            ).update({TaskInstance.state: TaskInstanceState.REMOVED})
+            session.flush()
+        return created_tis
 
     @staticmethod
     def get_run(session: Session, dag_id: str, execution_date: datetime) -> Optional['DagRun']:
         """
         Get a single DAG Run
-
         :meta private:
         :param session: Sqlalchemy ORM Session
         :param dag_id: DAG ID
@@ -1174,11 +1135,8 @@ class DagRun(Base, LoggingMixin):
     def schedule_tis(self, schedulable_tis: Iterable[TI], session: Session = NEW_SESSION) -> int:
         """
         Set the given task instances in to the scheduled state.
-
         Each element of ``schedulable_tis`` should have it's ``task`` attribute already set.
-
         Any EmptyOperator without callbacks is instead set straight to the success state.
-
         All the TIs should belong to this DagRun, but this code is in the hot-path, this is not checked -- it
         is the caller's responsibility to call this function only with TIs from a single dag run.
         """
